@@ -155,3 +155,20 @@ func TestMetadataMmOnlyRejectsOtherAuthority(t *testing.T) {
 		t.Fatal("invalid baseline did not request recovery")
 	}
 }
+
+func TestMetadataCap3OotDoesNotWaitForMm(t *testing.T) {
+	s, r := metadataTestRoom()
+	a := metadataTestClient(t, s, r, 1, "oot")
+	metadataTestCap3(t, a)
+	game := 0
+	metadataTestSend(a, metadataPacket{Type: metadataPrefix + "REQUEST", Game: &game, Request: 1})
+	nom := metadataTestRead(t, a)
+	yes, no := true, false
+	metadataTestSend(a, metadataPacket{Type: metadataPrefix + "STATE", Request: nom.Request, Of: 1,
+		Known: []bool{true, false}, OotSwitchKnown: &yes, OotSwitches: metadataTestSwitches([]interface{}{0, 4}),
+		MmSwitchKnown: &no, MmSwitches: metadataTestSwitches()})
+	state := metadataTestRead(t, a)
+	if state.Type != metadataPrefix+"STATE" || state.Known[0] != true || state.OotSwitchKnown == nil || !*state.OotSwitchKnown || *state.MmSwitchKnown {
+		t.Fatal("OoT capability waited for unsupported MM authority", state)
+	}
+}
