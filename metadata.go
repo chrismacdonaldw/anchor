@@ -45,6 +45,9 @@ type metadataPacket struct {
 	Entrances      []int               `json:"entrances"`
 	OotSwitchKnown *bool               `json:"ootSwitchKnown,omitempty"`
 	OotSwitches    json.RawMessage     `json:"ootSwitches,omitempty"`
+	MmSwitchKnown  *bool               `json:"mmSwitchKnown,omitempty"`
+	MmSwitches     json.RawMessage     `json:"mmSwitches,omitempty"`
+	MmSwitchOnly   bool                `json:"mmSwitchOnly,omitempty"`
 	Resync         bool                `json:"resync,omitempty"`
 }
 
@@ -57,6 +60,7 @@ type metadataWaiter struct {
 	id      uint64
 	request uint32
 	game    *int
+	mmOnly  bool
 }
 type metadataBaseline struct {
 	id          uint64
@@ -65,6 +69,8 @@ type metadataBaseline struct {
 	of          int
 	known       []bool
 	switchKnown bool
+	mmKnown     bool
+	mmOnly      bool
 	pages       map[int]metadataPacket
 	bytes       int
 }
@@ -78,6 +84,8 @@ type metadataNamespace struct {
 	entrances   map[int]bool
 	switchKnown bool
 	switches    map[int]uint32
+	mmKnown     bool
+	mmSwitches  map[int][2]uint32
 	waiters     []metadataWaiter
 	baseline    *metadataBaseline
 	edits       []metadataPacket
@@ -139,7 +147,61 @@ func (c *Client) metadataCapability() int {
 	if c.metadataCap < 2 {
 		return 1
 	}
+	if c.metadataCap >= 3 {
+		return 3
+	}
 	return 2
+}
+
+// The server validates the wire shape; SRAM persistence/reward eligibility belongs to MM.
+type metadataMmSwitch struct {
+	scene int
+	banks [2]uint32
+	flag  uint
+	on    bool
+}
+
+func metadataMmSwitchEntries(p metadataPacket) ([]metadataMmSwitch, bool) {
+	if len(p.MmSwitches) == 0 {
+		return nil, p.MmSwitchKnown == nil
+	}
+	var raw [][]json.RawMessage
+	if json.Unmarshal(p.MmSwitches, &raw) != nil || string(p.MmSwitches) == "null" {
+		return nil, false
+	}
+	state := p.Type == metadataPrefix+"STATE"
+	if state && p.MmSwitchKnown == nil || !state && p.MmSwitchKnown != nil {
+		return nil, false
+	}
+	seen := map[int]bool{}
+	rows := make([]metadataMmSwitch, 0, len(raw))
+	for _, row := range raw {
+		if len(row) != 3 {
+			return nil, false
+		}
+		scene, ok := metadataUint(row[0], 0x70) // Native SCENE_MAX is 0x71.
+		if !ok {
+			return nil, false
+		}
+		v := metadataMmSwitch{scene: int(scene)}
+		if state {
+			a, aok := metadataUint(row[1], uint64(^uint32(0)))
+			b, bok := metadataUint(row[2], uint64(^uint32(0)))
+			if !aok || !bok || a|b == 0 || !*p.MmSwitchKnown || seen[int(scene)] {
+				return nil, false
+			}
+			seen[int(scene)] = true
+			v.banks = [2]uint32{uint32(a), uint32(b)}
+		} else {
+			flag, ok := metadataUint(row[1], 63)
+			if !ok || (string(row[2]) != "true" && string(row[2]) != "false") {
+				return nil, false
+			}
+			v.flag, v.on = uint(flag), string(row[2]) == "true"
+		}
+		rows = append(rows, v) // Preserve repeated SET/UNSET order.
+	}
+	return rows, true
 }
 
 // Match native saved-switch exclusions. Temporary switches (bits >=32) are not part of this bank.
@@ -219,7 +281,9 @@ func metadataUint(raw json.RawMessage, max uint64) (uint64, bool) {
 }
 
 func metadataEntries(p metadataPacket) ([]metadataCheck, bool) {
-	if _, ok := metadataSwitchEntries(p); !ok || len(p.Checks)+len(p.Entrances) > 64 {
+	oot, ook := metadataSwitchEntries(p)
+	mm, mok := metadataMmSwitchEntries(p)
+	if !ook || !mok || len(p.Checks)+len(p.Entrances)+len(oot)+len(mm) > 64 {
 		return nil, false
 	}
 	checks := make([]metadataCheck, 0, len(p.Checks))
@@ -287,6 +351,9 @@ func (c *Client) handleMetadata(raw string) bool {
 		if p.Cap >= 2 {
 			c.metadataCap = 2
 		}
+		if p.Cap >= 3 {
+			c.metadataCap = 3
+		}
 		capability := c.metadataCap
 		state, team := c.state, c.team
 		c.mu.Unlock()
@@ -301,6 +368,12 @@ func (c *Client) handleMetadata(raw string) bool {
 		return true
 	}
 	if c.metadataCapability() < 2 && (p.OotSwitchKnown != nil || len(p.OotSwitches) != 0) {
+		return true
+	}
+	if c.metadataCapability() < 3 && (p.MmSwitchKnown != nil || len(p.MmSwitches) != 0 || p.MmSwitchOnly) {
+		return true
+	}
+	if p.MmSwitchOnly && (typ != metadataPrefix+"REQUEST" || p.Game == nil || *p.Game != 1) {
 		return true
 	}
 	if typ != metadataPrefix+"REQUEST" && typ != metadataPrefix+"STATE" && typ != metadataPrefix+"EDIT" {
@@ -322,7 +395,7 @@ func (c *Client) handleMetadata(raw string) bool {
 			c.sendMetadataResync(p.Scope, 0)
 			return true
 		}
-		ns = &metadataNamespace{scope: p.Scope, checks: map[int]metadataCheck{}, entrances: map[int]bool{}, switches: map[int]uint32{}}
+		ns = &metadataNamespace{scope: p.Scope, checks: map[int]metadataCheck{}, entrances: map[int]bool{}, switches: map[int]uint32{}, mmSwitches: map[int][2]uint32{}}
 		r.metadata[key] = ns
 	}
 	switch typ {
@@ -330,14 +403,14 @@ func (c *Client) handleMetadata(raw string) bool {
 		if p.Request == 0 {
 			return true
 		}
-		if ns.seq != 0 && !c.metadataNeedsBaseline(ns, p.Game) {
+		if ns.seq != 0 && !c.metadataNeedsBaseline(ns, p.Game, p.MmSwitchOnly) {
 			r.sendMetadataSnapshot(c, ns, p.Request)
 			return true
 		}
 		found := false
 		for i, w := range ns.waiters {
 			if w.id == c.id {
-				ns.waiters[i] = metadataWaiter{c.id, p.Request, p.Game}
+				ns.waiters[i] = metadataWaiter{c.id, p.Request, p.Game, p.MmSwitchOnly}
 				found = true
 				break
 			}
@@ -347,7 +420,7 @@ func (c *Client) handleMetadata(raw string) bool {
 				c.sendMetadataResync(p.Scope, ns.seq)
 				return true
 			}
-			ns.waiters = append(ns.waiters, metadataWaiter{c.id, p.Request, p.Game})
+			ns.waiters = append(ns.waiters, metadataWaiter{c.id, p.Request, p.Game, p.MmSwitchOnly})
 		}
 		r.nominateMetadata(ns)
 	case metadataPrefix + "STATE":
@@ -367,12 +440,22 @@ func (c *Client) handleMetadata(raw string) bool {
 			r.failMetadataBaseline(ns)
 			return true
 		}
+		if c.metadataCapability() >= 3 && p.MmSwitchKnown == nil {
+			r.failMetadataBaseline(ns)
+			return true
+		}
+		if b.mmOnly && (p.Known[0] || p.Known[1] || len(p.Checks) != 0 || len(p.Entrances) != 0 ||
+			(p.OotSwitchKnown != nil && *p.OotSwitchKnown)) {
+			r.failMetadataBaseline(ns)
+			return true
+		}
 		if b.of == 0 {
 			b.of = p.Of
 			b.known = append([]bool(nil), p.Known...)
 			b.switchKnown = p.OotSwitchKnown != nil && *p.OotSwitchKnown
+			b.mmKnown = p.MmSwitchKnown != nil && *p.MmSwitchKnown
 		}
-		if b.of != p.Of || b.known[0] != p.Known[0] || b.known[1] != p.Known[1] || b.switchKnown != (p.OotSwitchKnown != nil && *p.OotSwitchKnown) {
+		if b.of != p.Of || b.known[0] != p.Known[0] || b.known[1] != p.Known[1] || b.switchKnown != (p.OotSwitchKnown != nil && *p.OotSwitchKnown) || b.mmKnown != (p.MmSwitchKnown != nil && *p.MmSwitchKnown) {
 			r.failMetadataBaseline(ns)
 			return true
 		}
@@ -421,6 +504,9 @@ func (c *Client) sendMetadata(p metadataPacket) {
 	if c.metadataCapability() < 2 {
 		p.OotSwitchKnown, p.OotSwitches = nil, nil
 	}
+	if c.metadataCapability() < 3 {
+		p.MmSwitchKnown, p.MmSwitches, p.MmSwitchOnly = nil, nil, false
+	}
 	if p.Checks == nil {
 		p.Checks = [][]json.RawMessage{}
 	}
@@ -433,8 +519,11 @@ func (c *Client) sendMetadata(p metadataPacket) {
 	}
 }
 
-func (c *Client) metadataNeedsBaseline(ns *metadataNamespace, game *int) bool {
-	return game != nil && (!ns.known[*game] || (*game == 0 && c.metadataCapability() >= 2 && !ns.switchKnown))
+func (c *Client) metadataNeedsBaseline(ns *metadataNamespace, game *int, mmOnly bool) bool {
+	if mmOnly {
+		return !ns.mmKnown
+	}
+	return game != nil && (!ns.known[*game] || (*game == 0 && c.metadataCapability() >= 2 && !ns.switchKnown) || (*game == 1 && c.metadataCapability() >= 3 && !ns.mmKnown))
 }
 func (c *Client) sendMetadataResync(scope metadataScope, seq uint64) {
 	c.sendMetadata(metadataPacket{Type: metadataPrefix + "EDIT", Epoch: c.server.metadataEpoch, Scope: scope, Seq: seq, Resync: true})
@@ -447,6 +536,7 @@ func (r *Room) nominateMetadata(ns *metadataNamespace) {
 	// A fresh namespace has no authority: nominate the oldest authenticated owner offer.
 	var nominee *Client
 	var game *int
+	var mmOnly bool
 	if nominee == nil {
 		for _, w := range ns.waiters {
 			v, ok := r.clients.Load(w.id)
@@ -457,11 +547,12 @@ func (r *Room) nominateMetadata(ns *metadataNamespace) {
 			if !c.metadataMembership(ns.scope, true) || (w.game != nil && !c.metadataOwnsGame(*w.game)) {
 				continue
 			}
-			if ns.seq != 0 && !c.metadataNeedsBaseline(ns, w.game) {
+			if ns.seq != 0 && !c.metadataNeedsBaseline(ns, w.game, w.mmOnly) {
 				continue
 			}
 			nominee = c
 			game = w.game
+			mmOnly = w.mmOnly
 			break
 		}
 	}
@@ -472,9 +563,9 @@ func (r *Room) nominateMetadata(ns *metadataNamespace) {
 	if ns.nextRequest == 0 {
 		ns.nextRequest++
 	}
-	b := &metadataBaseline{id: nominee.id, request: ns.nextRequest, game: game, pages: map[int]metadataPacket{}}
+	b := &metadataBaseline{id: nominee.id, request: ns.nextRequest, game: game, mmOnly: mmOnly, pages: map[int]metadataPacket{}}
 	ns.baseline = b
-	nominee.sendMetadata(metadataPacket{Type: metadataPrefix + "REQUEST", Epoch: nominee.server.metadataEpoch, Scope: ns.scope, Request: b.request, Baseline: true, Game: game})
+	nominee.sendMetadata(metadataPacket{Type: metadataPrefix + "REQUEST", Epoch: nominee.server.metadataEpoch, Scope: ns.scope, Request: b.request, Baseline: true, Game: game, MmSwitchOnly: mmOnly})
 	time.AfterFunc(10*time.Second, func() {
 		r.metadataMu.Lock()
 		defer r.metadataMu.Unlock()
@@ -511,13 +602,16 @@ func (r *Room) finishMetadataBaseline(ns *metadataNamespace) {
 	}
 	fillSwitch := !ns.switchKnown && b.switchKnown && v.(*Client).metadataCapability() >= 2 &&
 		(ns.seq == 0 || b.game == nil || *b.game == 0)
-	if b.game != nil && !fill[*b.game] && !(*b.game == 0 && fillSwitch) {
+	fillMm := !ns.mmKnown && b.mmKnown && v.(*Client).metadataCapability() >= 3 &&
+		v.(*Client).metadataOwnsGame(1) && (b.game == nil || *b.game == 1)
+	if b.mmOnly && !fillMm || !b.mmOnly && b.game != nil && !fill[*b.game] && !(*b.game == 0 && fillSwitch) && !(*b.game == 1 && fillMm) {
 		r.failMetadataBaseline(ns)
 		return
 	}
 	checks := map[int]metadataCheck{}
 	entrances := map[int]bool{}
 	switches := map[int]uint32{}
+	mmSwitches := map[int][2]uint32{}
 	for page := 0; page < b.of; page++ {
 		p := b.pages[page]
 		rows, _ := metadataEntries(p)
@@ -544,8 +638,16 @@ func (r *Room) finishMetadataBaseline(ns *metadataNamespace) {
 			}
 			switches[bit.scene] = bit.mask
 		}
+		mmBits, _ := metadataMmSwitchEntries(p)
+		for _, bit := range mmBits {
+			if _, exists := mmSwitches[bit.scene]; exists {
+				r.failMetadataBaseline(ns)
+				return
+			}
+			mmSwitches[bit.scene] = bit.banks
+		}
 	}
-	count := len(ns.checks) + len(ns.entrances) + len(ns.switches)
+	count := len(ns.checks) + len(ns.entrances) + len(ns.switches) + len(ns.mmSwitches)
 	for key, row := range checks {
 		if fill[row.game] {
 			if _, exists := ns.checks[key]; !exists {
@@ -559,6 +661,9 @@ func (r *Room) finishMetadataBaseline(ns *metadataNamespace) {
 	if fillSwitch {
 		count += len(switches)
 	}
+	if fillMm {
+		count += len(mmSwitches)
+	}
 	if count > metadataMaxEntries || ns.seq == metadataMaxSeq {
 		r.failMetadataBaseline(ns)
 		return
@@ -567,8 +672,12 @@ func (r *Room) finishMetadataBaseline(ns *metadataNamespace) {
 	candidate.checks = maps.Clone(ns.checks)
 	candidate.entrances = maps.Clone(ns.entrances)
 	candidate.switches = maps.Clone(ns.switches)
+	candidate.mmSwitches = maps.Clone(ns.mmSwitches)
 	if fillSwitch {
 		candidate.switches, candidate.switchKnown = switches, true
+	}
+	if fillMm {
+		candidate.mmSwitches, candidate.mmKnown = mmSwitches, true
 	}
 	for key, row := range checks {
 		if fill[row.game] {
@@ -585,6 +694,7 @@ func (r *Room) finishMetadataBaseline(ns *metadataNamespace) {
 		return
 	}
 	ns.checks, ns.entrances, ns.switches, ns.switchKnown = candidate.checks, candidate.entrances, candidate.switches, candidate.switchKnown
+	ns.mmSwitches, ns.mmKnown = candidate.mmSwitches, candidate.mmKnown
 	wasEstablished := ns.seq != 0
 	ns.known[0] = ns.known[0] || fill[0]
 	ns.known[1] = ns.known[1] || fill[1]
@@ -596,7 +706,7 @@ func (r *Room) finishMetadataBaseline(ns *metadataNamespace) {
 		if v, ok := r.clients.Load(w.id); ok {
 			c := v.(*Client)
 			if c.metadataMembership(ns.scope, true) {
-				if c.metadataNeedsBaseline(ns, w.game) {
+				if c.metadataNeedsBaseline(ns, w.game, w.mmOnly) {
 					ns.waiters = append(ns.waiters, w)
 				} else {
 					r.sendMetadataSnapshot(c, ns, w.request)
@@ -626,11 +736,16 @@ func (r *Room) applyMetadataEdit(ns *metadataNamespace, p metadataPacket) {
 	}
 	rows, _ := metadataEntries(p)
 	bits, _ := metadataSwitchEntries(p)
+	mmBits, _ := metadataMmSwitchEntries(p)
 	if len(bits) > 0 && !ns.switchKnown {
 		v.(*Client).sendMetadataResync(ns.scope, ns.seq)
 		return
 	}
-	count := len(ns.checks) + len(ns.entrances) + len(ns.switches)
+	if len(mmBits) > 0 && !ns.mmKnown {
+		v.(*Client).sendMetadataResync(ns.scope, ns.seq)
+		return
+	}
+	count := len(ns.checks) + len(ns.entrances) + len(ns.switches) + len(ns.mmSwitches)
 	for _, row := range rows {
 		if !ns.known[row.game] {
 			v.(*Client).sendMetadataResync(ns.scope, ns.seq)
@@ -657,6 +772,21 @@ func (r *Room) applyMetadataEdit(ns *metadataNamespace, p metadataPacket) {
 	candidate.checks = maps.Clone(ns.checks)
 	candidate.entrances = maps.Clone(ns.entrances)
 	candidate.switches = maps.Clone(ns.switches)
+	candidate.mmSwitches = maps.Clone(ns.mmSwitches)
+	for _, bit := range mmBits {
+		banks := candidate.mmSwitches[bit.scene]
+		mask := uint32(1) << (bit.flag % 32)
+		if bit.on {
+			banks[bit.flag/32] |= mask
+		} else {
+			banks[bit.flag/32] &^= mask
+		}
+		if banks == [2]uint32{} {
+			delete(candidate.mmSwitches, bit.scene)
+		} else {
+			candidate.mmSwitches[bit.scene] = banks
+		}
+	}
 	for _, bit := range bits {
 		mask := uint32(1) << bit.bit
 		if bit.on {
@@ -680,11 +810,12 @@ func (r *Room) applyMetadataEdit(ns *metadataNamespace, p metadataPacket) {
 	for _, e := range p.Entrances {
 		candidate.entrances[e] = true
 	}
-	if len(candidate.checks)+len(candidate.entrances)+len(candidate.switches) > metadataMaxEntries || !metadataSnapshotFits(&candidate) {
+	if len(candidate.checks)+len(candidate.entrances)+len(candidate.switches)+len(candidate.mmSwitches) > metadataMaxEntries || !metadataSnapshotFits(&candidate) {
 		v.(*Client).sendMetadataResync(ns.scope, ns.seq)
 		return
 	}
 	ns.checks, ns.entrances, ns.switches = candidate.checks, candidate.entrances, candidate.switches
+	ns.mmSwitches = candidate.mmSwitches
 	ns.seq++
 	p.Type = metadataPrefix + "EDIT"
 	p.Seq = ns.seq
@@ -704,6 +835,10 @@ func (c *Client) metadataOwnsEntries(p metadataPacket) bool {
 	}
 	bits, _ := metadataSwitchEntries(p)
 	if len(bits) > 0 && (c.metadataCapability() < 2 || !c.metadataOwnsGame(0)) {
+		return false
+	}
+	mmBits, _ := metadataMmSwitchEntries(p)
+	if len(mmBits) > 0 && (c.metadataCapability() < 3 || !c.metadataOwnsGame(1)) {
 		return false
 	}
 	return len(p.Entrances) == 0 || c.metadataOwnsGame(0)
@@ -745,7 +880,12 @@ func metadataSnapshotPackets(ns *metadataNamespace, request uint32, epoch string
 		scenes = append(scenes, scene)
 	}
 	sort.Ints(scenes)
-	total := len(keys) + len(entrances) + len(scenes)
+	mmScenes := make([]int, 0, len(ns.mmSwitches))
+	for scene := range ns.mmSwitches {
+		mmScenes = append(mmScenes, scene)
+	}
+	sort.Ints(mmScenes)
+	total := len(keys) + len(entrances) + len(scenes) + len(mmScenes)
 	pages := (total + 63) / 64
 	if pages == 0 {
 		pages = 1
@@ -754,18 +894,25 @@ func metadataSnapshotPackets(ns *metadataNamespace, request uint32, epoch string
 	for page := 0; page < pages; page++ {
 		p := metadataPacket{Type: metadataPrefix + "STATE", Epoch: epoch, Scope: ns.scope, Request: request, Seq: ns.seq, Page: page, Of: pages, Known: []bool{ns.known[0], ns.known[1]}}
 		p.OotSwitchKnown = &ns.switchKnown
+		p.MmSwitchKnown = &ns.mmKnown
 		switchRows := [][]uint32{}
+		mmRows := [][]uint32{}
 		for index := page * 64; index < (page+1)*64 && index < total; index++ {
 			if index < len(keys) {
 				p.Checks = append(p.Checks, metadataRow(ns.checks[keys[index]]))
 			} else if index < len(keys)+len(entrances) {
 				p.Entrances = append(p.Entrances, entrances[index-len(keys)])
-			} else {
+			} else if index < len(keys)+len(entrances)+len(scenes) {
 				scene := scenes[index-len(keys)-len(entrances)]
 				switchRows = append(switchRows, []uint32{uint32(scene), ns.switches[scene]})
+			} else {
+				scene := mmScenes[index-len(keys)-len(entrances)-len(scenes)]
+				banks := ns.mmSwitches[scene]
+				mmRows = append(mmRows, []uint32{uint32(scene), banks[0], banks[1]})
 			}
 		}
 		p.OotSwitches, _ = json.Marshal(switchRows)
+		p.MmSwitches, _ = json.Marshal(mmRows)
 		if p.Checks == nil {
 			p.Checks = [][]json.RawMessage{}
 		}
