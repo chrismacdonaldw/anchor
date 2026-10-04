@@ -10,11 +10,13 @@ import (
 )
 
 type Room struct {
-	id      string
-	clients sync.Map
-	teams   sync.Map
-	state   string     // Room Settings
-	mu      sync.Mutex // Mutex for safely updating state
+	metadataMu sync.Mutex
+	metadata   map[metadataNamespaceKey]*metadataNamespace
+	id         string
+	clients    sync.Map
+	teams      sync.Map
+	state      string     // Room Settings
+	mu         sync.Mutex // Mutex for safely updating state
 }
 
 func NewRoom(id string, ownerClientId uint64, packet string) *Room {

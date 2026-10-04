@@ -24,6 +24,7 @@ const MAX_PACKET_SIZE = 8 * 1024 * 1024
 const INITIAL_SCAN_BUFFER = 64 * 1024
 
 type Server struct {
+	metadataEpoch     string
 	listener          net.Listener
 	quietMode         atomic.Bool
 	onlineClients     sync.Map
@@ -34,6 +35,7 @@ type Server struct {
 
 func NewServer() *Server {
 	s := &Server{
+		metadataEpoch:     newMetadataEpoch(),
 		onlineClients:     sync.Map{},
 		quietMode:         atomic.Bool{},
 		rooms:             sync.Map{},
@@ -47,7 +49,11 @@ func NewServer() *Server {
 }
 
 func (s *Server) Start(errChan chan error) {
-	listener, err := net.Listen("tcp", ":43383")
+	address := os.Getenv("ANCHOR_LISTEN_ADDR")
+	if address == "" {
+		address = "127.0.0.1:43383"
+	}
+	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -58,7 +64,7 @@ func (s *Server) Start(errChan chan error) {
 	go s.parseStats(errChan)
 	go s.statsHeartbeat(errChan)
 
-	log.Println("Server running on :43383")
+	log.Println("Server running on", address)
 	log.Println("Quiet mode:", s.quietMode.Load())
 
 	for {
