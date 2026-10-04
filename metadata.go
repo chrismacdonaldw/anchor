@@ -48,6 +48,9 @@ type metadataPacket struct {
 	MmSwitchKnown  *bool               `json:"mmSwitchKnown,omitempty"`
 	MmSwitches     json.RawMessage     `json:"mmSwitches,omitempty"`
 	MmSwitchOnly   bool                `json:"mmSwitchOnly,omitempty"`
+	MmOwlKnown     *bool               `json:"mmOwlKnown,omitempty"`
+	MmOwls         *uint16             `json:"mmOwls,omitempty"`
+	MmProgressOnly bool                `json:"mmProgressOnly,omitempty"`
 	Resync         bool                `json:"resync,omitempty"`
 }
 
@@ -57,22 +60,26 @@ type metadataCheck struct {
 	skipped     bool
 }
 type metadataWaiter struct {
-	id      uint64
-	request uint32
-	game    *int
-	mmOnly  bool
+	id             uint64
+	request        uint32
+	game           *int
+	mmOnly         bool
+	mmProgressOnly bool
 }
 type metadataBaseline struct {
-	id          uint64
-	request     uint32
-	game        *int
-	of          int
-	known       []bool
-	switchKnown bool
-	mmKnown     bool
-	mmOnly      bool
-	pages       map[int]metadataPacket
-	bytes       int
+	id             uint64
+	request        uint32
+	game           *int
+	of             int
+	known          []bool
+	switchKnown    bool
+	mmKnown        bool
+	mmOnly         bool
+	mmProgressOnly bool
+	owlKnown       bool
+	owls           uint16
+	pages          map[int]metadataPacket
+	bytes          int
 }
 type metadataNamespaceKey struct{ team, seed string }
 
@@ -86,6 +93,8 @@ type metadataNamespace struct {
 	switches    map[int]uint32
 	mmKnown     bool
 	mmSwitches  map[int][2]uint32
+	owlKnown    bool
+	owls        uint16
 	waiters     []metadataWaiter
 	baseline    *metadataBaseline
 	edits       []metadataPacket
@@ -146,6 +155,9 @@ func (c *Client) metadataCapability() int {
 	}
 	if c.metadataCap < 2 {
 		return 1
+	}
+	if c.metadataCap >= 4 {
+		return 4
 	}
 	if c.metadataCap >= 3 {
 		return 3
@@ -283,7 +295,7 @@ func metadataUint(raw json.RawMessage, max uint64) (uint64, bool) {
 func metadataEntries(p metadataPacket) ([]metadataCheck, bool) {
 	oot, ook := metadataSwitchEntries(p)
 	mm, mok := metadataMmSwitchEntries(p)
-	if !ook || !mok || len(p.Checks)+len(p.Entrances)+len(oot)+len(mm) > 64 {
+	if !ook || !mok || !metadataOwlValid(p) || len(p.Checks)+len(p.Entrances)+len(oot)+len(mm) > 64 {
 		return nil, false
 	}
 	checks := make([]metadataCheck, 0, len(p.Checks))
@@ -330,6 +342,19 @@ func metadataEntries(p metadataPacket) ([]metadataCheck, bool) {
 	return checks, true
 }
 
+func metadataOwlValid(p metadataPacket) bool {
+	if p.MmOwls == nil && p.MmOwlKnown == nil {
+		return true
+	}
+	if p.MmOwls == nil || *p.MmOwls > 0x3ff {
+		return false
+	}
+	if p.Type == metadataPrefix+"STATE" {
+		return p.MmOwlKnown != nil && (*p.MmOwlKnown || *p.MmOwls == 0)
+	}
+	return p.Type == metadataPrefix+"EDIT" && p.MmOwlKnown == nil && *p.MmOwls != 0
+}
+
 // Special packets never enter the stock Team state/queue or generic target routing.
 // Replies are reconstructed with server origin; caller-supplied IDs are ignored.
 func (c *Client) handleMetadata(raw string) bool {
@@ -354,6 +379,9 @@ func (c *Client) handleMetadata(raw string) bool {
 		if p.Cap >= 3 {
 			c.metadataCap = 3
 		}
+		if p.Cap >= 4 {
+			c.metadataCap = 4
+		}
 		capability := c.metadataCap
 		state, team := c.state, c.team
 		c.mu.Unlock()
@@ -372,6 +400,26 @@ func (c *Client) handleMetadata(raw string) bool {
 	}
 	if c.metadataCapability() < 3 && (p.MmSwitchKnown != nil || len(p.MmSwitches) != 0 || p.MmSwitchOnly) {
 		return true
+	}
+	if c.metadataCapability() < 4 && (p.MmOwlKnown != nil || p.MmOwls != nil || p.MmProgressOnly) {
+		return true
+	}
+	if !metadataOwlValid(p) {
+		return true
+	}
+	if p.MmProgressOnly && (p.MmSwitchOnly || typ != metadataPrefix+"REQUEST" || p.Game == nil || *p.Game != 1) {
+		return true
+	}
+	if p.MmProgressOnly {
+		if len(p.Checks) != 0 || len(p.Entrances) != 0 || len(p.OotSwitches) != 0 ||
+			(p.OotSwitchKnown != nil && *p.OotSwitchKnown) {
+			return true
+		}
+		for _, known := range p.Known {
+			if known {
+				return true
+			}
+		}
 	}
 	if p.MmSwitchOnly && (typ != metadataPrefix+"REQUEST" || p.Game == nil || *p.Game != 1) {
 		return true
@@ -403,14 +451,14 @@ func (c *Client) handleMetadata(raw string) bool {
 		if p.Request == 0 {
 			return true
 		}
-		if ns.seq != 0 && !c.metadataNeedsBaseline(ns, p.Game, p.MmSwitchOnly) {
+		if ns.seq != 0 && !c.metadataNeedsBaseline(ns, p.Game, p.MmSwitchOnly, p.MmProgressOnly) {
 			r.sendMetadataSnapshot(c, ns, p.Request)
 			return true
 		}
 		found := false
 		for i, w := range ns.waiters {
 			if w.id == c.id {
-				ns.waiters[i] = metadataWaiter{c.id, p.Request, p.Game, p.MmSwitchOnly}
+				ns.waiters[i] = metadataWaiter{c.id, p.Request, p.Game, p.MmSwitchOnly, p.MmProgressOnly}
 				found = true
 				break
 			}
@@ -420,7 +468,7 @@ func (c *Client) handleMetadata(raw string) bool {
 				c.sendMetadataResync(p.Scope, ns.seq)
 				return true
 			}
-			ns.waiters = append(ns.waiters, metadataWaiter{c.id, p.Request, p.Game, p.MmSwitchOnly})
+			ns.waiters = append(ns.waiters, metadataWaiter{c.id, p.Request, p.Game, p.MmSwitchOnly, p.MmProgressOnly})
 		}
 		r.nominateMetadata(ns)
 	case metadataPrefix + "STATE":
@@ -444,7 +492,11 @@ func (c *Client) handleMetadata(raw string) bool {
 			r.failMetadataBaseline(ns)
 			return true
 		}
-		if b.mmOnly && (p.Known[0] || p.Known[1] || len(p.Checks) != 0 || len(p.Entrances) != 0 ||
+		if c.metadataCapability() >= 4 && (p.MmOwlKnown == nil || p.MmOwls == nil) {
+			r.failMetadataBaseline(ns)
+			return true
+		}
+		if (b.mmOnly || b.mmProgressOnly) && (p.Known[0] || p.Known[1] || len(p.Checks) != 0 || len(p.Entrances) != 0 ||
 			(p.OotSwitchKnown != nil && *p.OotSwitchKnown)) {
 			r.failMetadataBaseline(ns)
 			return true
@@ -454,8 +506,16 @@ func (c *Client) handleMetadata(raw string) bool {
 			b.known = append([]bool(nil), p.Known...)
 			b.switchKnown = p.OotSwitchKnown != nil && *p.OotSwitchKnown
 			b.mmKnown = p.MmSwitchKnown != nil && *p.MmSwitchKnown
+			b.owlKnown = p.MmOwlKnown != nil && *p.MmOwlKnown
+			if p.MmOwls != nil {
+				b.owls = *p.MmOwls
+			}
 		}
 		if b.of != p.Of || b.known[0] != p.Known[0] || b.known[1] != p.Known[1] || b.switchKnown != (p.OotSwitchKnown != nil && *p.OotSwitchKnown) || b.mmKnown != (p.MmSwitchKnown != nil && *p.MmSwitchKnown) {
+			r.failMetadataBaseline(ns)
+			return true
+		}
+		if b.owlKnown != (p.MmOwlKnown != nil && *p.MmOwlKnown) || (p.MmOwls != nil && b.owls != *p.MmOwls) {
 			r.failMetadataBaseline(ns)
 			return true
 		}
@@ -507,6 +567,9 @@ func (c *Client) sendMetadata(p metadataPacket) {
 	if c.metadataCapability() < 3 {
 		p.MmSwitchKnown, p.MmSwitches, p.MmSwitchOnly = nil, nil, false
 	}
+	if c.metadataCapability() < 4 {
+		p.MmOwlKnown, p.MmOwls, p.MmProgressOnly = nil, nil, false
+	}
 	if p.Checks == nil {
 		p.Checks = [][]json.RawMessage{}
 	}
@@ -519,11 +582,14 @@ func (c *Client) sendMetadata(p metadataPacket) {
 	}
 }
 
-func (c *Client) metadataNeedsBaseline(ns *metadataNamespace, game *int, mmOnly bool) bool {
+func (c *Client) metadataNeedsBaseline(ns *metadataNamespace, game *int, mmOnly, mmProgressOnly bool) bool {
+	if mmProgressOnly {
+		return !ns.mmKnown || !ns.owlKnown
+	}
 	if mmOnly {
 		return !ns.mmKnown
 	}
-	return game != nil && (!ns.known[*game] || (*game == 0 && c.metadataCapability() >= 2 && !ns.switchKnown) || (*game == 1 && c.metadataCapability() >= 3 && !ns.mmKnown))
+	return game != nil && (!ns.known[*game] || (*game == 0 && c.metadataCapability() >= 2 && !ns.switchKnown) || (*game == 1 && c.metadataCapability() >= 3 && !ns.mmKnown) || (*game == 1 && c.metadataCapability() >= 4 && !ns.owlKnown))
 }
 func (c *Client) sendMetadataResync(scope metadataScope, seq uint64) {
 	c.sendMetadata(metadataPacket{Type: metadataPrefix + "EDIT", Epoch: c.server.metadataEpoch, Scope: scope, Seq: seq, Resync: true})
@@ -537,6 +603,7 @@ func (r *Room) nominateMetadata(ns *metadataNamespace) {
 	var nominee *Client
 	var game *int
 	var mmOnly bool
+	var mmProgressOnly bool
 	if nominee == nil {
 		for _, w := range ns.waiters {
 			v, ok := r.clients.Load(w.id)
@@ -547,12 +614,13 @@ func (r *Room) nominateMetadata(ns *metadataNamespace) {
 			if !c.metadataMembership(ns.scope, true) || (w.game != nil && !c.metadataOwnsGame(*w.game)) {
 				continue
 			}
-			if ns.seq != 0 && !c.metadataNeedsBaseline(ns, w.game, w.mmOnly) {
+			if ns.seq != 0 && !c.metadataNeedsBaseline(ns, w.game, w.mmOnly, w.mmProgressOnly) {
 				continue
 			}
 			nominee = c
 			game = w.game
 			mmOnly = w.mmOnly
+			mmProgressOnly = w.mmProgressOnly
 			break
 		}
 	}
@@ -563,9 +631,9 @@ func (r *Room) nominateMetadata(ns *metadataNamespace) {
 	if ns.nextRequest == 0 {
 		ns.nextRequest++
 	}
-	b := &metadataBaseline{id: nominee.id, request: ns.nextRequest, game: game, mmOnly: mmOnly, pages: map[int]metadataPacket{}}
+	b := &metadataBaseline{id: nominee.id, request: ns.nextRequest, game: game, mmOnly: mmOnly, mmProgressOnly: mmProgressOnly, pages: map[int]metadataPacket{}}
 	ns.baseline = b
-	nominee.sendMetadata(metadataPacket{Type: metadataPrefix + "REQUEST", Epoch: nominee.server.metadataEpoch, Scope: ns.scope, Request: b.request, Baseline: true, Game: game, MmSwitchOnly: mmOnly})
+	nominee.sendMetadata(metadataPacket{Type: metadataPrefix + "REQUEST", Epoch: nominee.server.metadataEpoch, Scope: ns.scope, Request: b.request, Baseline: true, Game: game, MmSwitchOnly: mmOnly, MmProgressOnly: mmProgressOnly})
 	time.AfterFunc(10*time.Second, func() {
 		r.metadataMu.Lock()
 		defer r.metadataMu.Unlock()
@@ -604,7 +672,10 @@ func (r *Room) finishMetadataBaseline(ns *metadataNamespace) {
 		(ns.seq == 0 || b.game == nil || *b.game == 0)
 	fillMm := !ns.mmKnown && b.mmKnown && v.(*Client).metadataCapability() >= 3 &&
 		v.(*Client).metadataOwnsGame(1) && (b.game == nil || *b.game == 1)
-	if b.mmOnly && !fillMm || !b.mmOnly && b.game != nil && !fill[*b.game] && !(*b.game == 0 && fillSwitch) && !(*b.game == 1 && fillMm) {
+	owlOffer := !b.mmOnly && b.owlKnown && v.(*Client).metadataCapability() >= 4 &&
+		v.(*Client).metadataOwnsGame(1) && (b.game == nil || *b.game == 1)
+	if b.mmProgressOnly && (!b.mmKnown || !owlOffer) || b.mmOnly && !fillMm ||
+		!b.mmOnly && !b.mmProgressOnly && b.game != nil && !fill[*b.game] && !(*b.game == 0 && fillSwitch) && !(*b.game == 1 && (fillMm || owlOffer)) {
 		r.failMetadataBaseline(ns)
 		return
 	}
@@ -679,6 +750,10 @@ func (r *Room) finishMetadataBaseline(ns *metadataNamespace) {
 	if fillMm {
 		candidate.mmSwitches, candidate.mmKnown = mmSwitches, true
 	}
+	if owlOffer {
+		candidate.owls |= b.owls
+		candidate.owlKnown = true
+	}
 	for key, row := range checks {
 		if fill[row.game] {
 			candidate.checks[key] = row
@@ -695,6 +770,7 @@ func (r *Room) finishMetadataBaseline(ns *metadataNamespace) {
 	}
 	ns.checks, ns.entrances, ns.switches, ns.switchKnown = candidate.checks, candidate.entrances, candidate.switches, candidate.switchKnown
 	ns.mmSwitches, ns.mmKnown = candidate.mmSwitches, candidate.mmKnown
+	ns.owls, ns.owlKnown = candidate.owls, candidate.owlKnown
 	wasEstablished := ns.seq != 0
 	ns.known[0] = ns.known[0] || fill[0]
 	ns.known[1] = ns.known[1] || fill[1]
@@ -706,7 +782,7 @@ func (r *Room) finishMetadataBaseline(ns *metadataNamespace) {
 		if v, ok := r.clients.Load(w.id); ok {
 			c := v.(*Client)
 			if c.metadataMembership(ns.scope, true) {
-				if c.metadataNeedsBaseline(ns, w.game, w.mmOnly) {
+				if c.metadataNeedsBaseline(ns, w.game, w.mmOnly, w.mmProgressOnly) {
 					ns.waiters = append(ns.waiters, w)
 				} else {
 					r.sendMetadataSnapshot(c, ns, w.request)
@@ -745,6 +821,10 @@ func (r *Room) applyMetadataEdit(ns *metadataNamespace, p metadataPacket) {
 		v.(*Client).sendMetadataResync(ns.scope, ns.seq)
 		return
 	}
+	if p.MmOwls != nil && !ns.owlKnown {
+		v.(*Client).sendMetadataResync(ns.scope, ns.seq)
+		return
+	}
 	count := len(ns.checks) + len(ns.entrances) + len(ns.switches) + len(ns.mmSwitches)
 	for _, row := range rows {
 		if !ns.known[row.game] {
@@ -773,6 +853,9 @@ func (r *Room) applyMetadataEdit(ns *metadataNamespace, p metadataPacket) {
 	candidate.entrances = maps.Clone(ns.entrances)
 	candidate.switches = maps.Clone(ns.switches)
 	candidate.mmSwitches = maps.Clone(ns.mmSwitches)
+	if p.MmOwls != nil {
+		candidate.owls |= *p.MmOwls
+	}
 	for _, bit := range mmBits {
 		banks := candidate.mmSwitches[bit.scene]
 		mask := uint32(1) << (bit.flag % 32)
@@ -816,6 +899,7 @@ func (r *Room) applyMetadataEdit(ns *metadataNamespace, p metadataPacket) {
 	}
 	ns.checks, ns.entrances, ns.switches = candidate.checks, candidate.entrances, candidate.switches
 	ns.mmSwitches = candidate.mmSwitches
+	ns.owls = candidate.owls
 	ns.seq++
 	p.Type = metadataPrefix + "EDIT"
 	p.Seq = ns.seq
@@ -839,6 +923,9 @@ func (c *Client) metadataOwnsEntries(p metadataPacket) bool {
 	}
 	mmBits, _ := metadataMmSwitchEntries(p)
 	if len(mmBits) > 0 && (c.metadataCapability() < 3 || !c.metadataOwnsGame(1)) {
+		return false
+	}
+	if p.MmOwls != nil && (c.metadataCapability() < 4 || !c.metadataOwnsGame(1)) {
 		return false
 	}
 	return len(p.Entrances) == 0 || c.metadataOwnsGame(0)
@@ -891,10 +978,12 @@ func metadataSnapshotPackets(ns *metadataNamespace, request uint32, epoch string
 		pages = 1
 	}
 	out := make([]metadataPacket, 0, pages)
+	owlKnown, owls := ns.owlKnown, ns.owls
 	for page := 0; page < pages; page++ {
 		p := metadataPacket{Type: metadataPrefix + "STATE", Epoch: epoch, Scope: ns.scope, Request: request, Seq: ns.seq, Page: page, Of: pages, Known: []bool{ns.known[0], ns.known[1]}}
 		p.OotSwitchKnown = &ns.switchKnown
 		p.MmSwitchKnown = &ns.mmKnown
+		p.MmOwlKnown, p.MmOwls = &owlKnown, &owls
 		switchRows := [][]uint32{}
 		mmRows := [][]uint32{}
 		for index := page * 64; index < (page+1)*64 && index < total; index++ {
