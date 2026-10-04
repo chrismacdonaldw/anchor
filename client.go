@@ -13,18 +13,22 @@ import (
 const sendQueueSize = 256
 
 type Client struct {
-	id           uint64
-	conn         net.Conn
-	sendCh       chan string // Outgoing packet queue, drained by the connection's writeLoop
-	server       *Server
-	room         *Room
-	team         *Team
-	state        string     // Client state, current scene, etc.
-	mu           sync.Mutex // Mutex for safely updating state
-	lastActivity time.Time
+	metadataCapable bool
+	metadataCap     int
+	id              uint64
+	conn            net.Conn
+	sendCh          chan string // Outgoing packet queue, drained by the connection's writeLoop
+	server          *Server
+	room            *Room
+	team            *Team
+	state           string     // Client state, current scene, etc.
+	mu              sync.Mutex // Mutex for safely updating state
+	lastActivity    time.Time
 }
 
 func (c *Client) attachConnLocked(conn net.Conn) {
+	c.metadataCapable = false
+	c.metadataCap = 0
 	c.conn = conn
 	c.sendCh = make(chan string, sendQueueSize)
 	go c.writeLoop(conn, c.sendCh)
@@ -59,6 +63,10 @@ func (c *Client) handlePacket(packet string) {
 	c.mu.Lock()
 	c.lastActivity = time.Now()
 	c.mu.Unlock()
+
+	if c.handleMetadata(packet) {
+		return
+	}
 
 	packetType := gjson.Get(packet, "type").String()
 
@@ -163,6 +171,7 @@ func (c *Client) handlePacket(packet string) {
 		c.room.mu.Lock()
 		c.room.state = gjson.Get(packet, "state").Raw
 		c.room.mu.Unlock()
+		c.room.cancelMetadataWork()
 		c.room.broadcastPacket(packet)
 	} else if targetTeamId.Exists() {
 		team := c.room.findOrCreateTeam(targetTeamId.String())
